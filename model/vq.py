@@ -1,60 +1,59 @@
-from torch import Tensor, nn, torch
+import torch
+from torch import Tensor, nn
 from torch.nn import functional as F
 
 
 class VectorQuantizer(nn.Module):
     def __init__(
-        self, num_embeddings: int, d_model: int, commitment_cost: float = 0.25
+        self, num_embeddings: int, latent_dim: int, commitment_cost: float = 0.25
     ):
         super().__init__()
-        self.d_model = d_model
-        self.num_embeddings = num_embeddings
-        self.commitment_cost = commitment_cost
+        self.latent_dim = latent_dim # ty: ignore[unresolved-attribute]
+        self.num_embeddings = num_embeddings # ty: ignore[unresolved-attribute]
+        self.commitment_cost = commitment_cost # ty: ignore[unresolved-attribute]
 
-        # The codebook: K vectors of size d_model
-        self.codebook = nn.Embedding(num_embeddings, d_model)
+        # codebook: K vectors of size latent_dim, shared between encoder and decoder
+        self.codebook = nn.Embedding(num_embeddings, latent_dim)
         self.codebook.weight.data.uniform_(-1 / num_embeddings, 1 / num_embeddings)
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        # x shape: (B, T, num_patches, d_model)
-        B, T, num_patches, d_model = x.shape
+        # x shape: (B, T, num_patches, latent_dim)
+        B, T, num_patches, latent_dim = x.shape
+        assert latent_dim == self.latent_dim, f"Input dim {latent_dim} != codebook dim {self.latent_dim}"
 
-        # Flatten to B * T * num_patches, d_model. Shape (M, d_model)
-        x_flat = x.view(B * T * num_patches, d_model)
+        # flatten to B * T * num_patches, latent_dim
+        z_e_flat = x.view(B * T * num_patches, self.latent_dim)  # (M, latent_dim)
 
-        # Compute squared distances using expanded formula
-        codebook = self.codebook.weight  # (K, d_model)
+        # compute squared distances using expanded formula
+        codebook = self.codebook.weight  # (K, latent_dim)
 
-        # Sum each of the N vectors (with dim=-1) -> results in shape (N, 1)
-        # equal to
-        x_sq = (x_flat**2).sum(dim=-1, keepdim=True)
+        # sum each of the M vectors (with dim=-1) -> results in shape (M, 1)
+        z_e_sq = (z_e_flat**2).sum(dim=-1, keepdim=True)
 
-        # Sum K codebook vectors -> result shape, (K,1)
+        # sum K codebook vectors -> result shape, (K)
         e_sq = (codebook**2).sum(dim=-1)
 
-        # Compute the dot products x·e for all pairs -> result shape: (N, K)
-        #   because the shape of x_flat is (M, d_model) & codebook is (K, d_model)
-        #   we can transpose this so it's a matrix multiplication eg. (M, d_model) @ (d_model, K)
-        #   this gives us a matrix of shape ()
-        xe = x_flat @ codebook.T
+        # compute the dot products z_e·e for all pairs -> result shape: (M, K)
+        #   because the shape of z_e_flat is (M, latent_dim) & codebook is (K, latent_dim)
+        #   we can transpose this so it's a matrix multiplication eg. (M, latent_dim) @ (latent_dim, K)
+        ze = z_e_flat @ codebook.T # (M, K)
 
-        # Distances are the elementwise addition - 2 * xe
-        distances = x_sq + e_sq - 2 * xe
+        # distances are the elementwise addition - 2 * ze
+        distances = z_e_sq + e_sq - 2 * ze # (M, K)
 
-        # Get the index with the smallest distance (closest)
-        # shape (N, num_encodings) eg.
-        encoding_indices = torch.argmin(distances, dim=-1)
+        # get the index with the smallest distance (closest)
+        encoding_indices = torch.argmin(distances, dim=-1) # (M)
 
-        # Gather the closest codebook vectors
-        z_q = self.codebook(encoding_indices)
-        z_q = z_q.view(B, T, num_patches, d_model)
+        # gather the closest codebook vectors
+        z_q = self.codebook(encoding_indices)  # (M, latent_dim)
+        z_q = z_q.view(B, T, num_patches, self.latent_dim)  # (B, T, num_patches, latent_dim)
 
-        # Compute the commitment loss
+        # compute the commitment loss
         loss = F.mse_loss(z_q, x.detach()) + self.commitment_cost * F.mse_loss(
             z_q.detach(), x
         )
 
-        # Straight-through estimator trick for gradient propagation
+        # straight-through estimator trick for gradient propagation
         z_q = x + (z_q - x).detach()
 
         return z_q, loss, encoding_indices
