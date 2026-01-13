@@ -5,8 +5,9 @@ from jax import numpy as jnp
 from model.transformer import STTransformer
 from model.vq import VectorQuantizer
 
-# infers latent actions from frames t & t1
+
 class LatentActionModel(nn.Module):
+    """infers latent actions between consecutive frames"""
     def __init__(
         self,
         *,
@@ -52,39 +53,17 @@ class LatentActionModel(nn.Module):
     def __call__(
         self, z: jax.Array, *, deterministic: bool = False
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Infer latent actions from tokenized video frames.
-
-        Args:
-            z: Tokenized video frames (B, T, num_patches, latent_dim)
-            deterministic: Whether to use deterministic mode (no dropout)
-
-        Returns:
-            actions: Quantized latent actions (B, T-1, action_dim)
-            loss: VQ commitment loss
-            indices: Action indices (B, T-1)
-        """
+        """z: (B, T, P, latent_dim) -> actions (B, T-1, action_dim), vq_loss, indices"""
         B, T, P, _ = z.shape
 
-        # project to d_model
-        x = self.input_proj(z)  # (B, T, P, d_model)
-
-        # add positional embeddings
+        x = self.input_proj(z)
         x = x + self.spatial_pos.value + self.temporal_pos.value[:, :T, :, :]
+        x = self.transformer(x, deterministic=deterministic)
+        x = self.action_proj(x)
+        x = x.mean(axis=2)  # pool patches
 
-        # run through transformer
-        x = self.transformer(x, deterministic=deterministic)  # (B, T, P, d_model)
-
-        # project to action dimension
-        x = self.action_proj(x)  # (B, T, P, action_dim)
-
-        # pool across patches (mean pooling)
-        x = x.mean(axis=2)  # (B, T, action_dim)
-
-        # compute actions as difference between consecutive frames
-        # action_t represents the action that takes frame t to frame t+1
-        actions = x[:, 1:, :] - x[:, :-1, :]  # (B, T-1, action_dim)
-
-        # quantize actions
+        # action = difference between consecutive frame embeddings
+        actions = x[:, 1:, :] - x[:, :-1, :]
         actions_q, loss, indices = self.action_vq(actions)
 
         return actions_q, loss, indices
@@ -92,31 +71,11 @@ class LatentActionModel(nn.Module):
     def encode_action(
         self, z_t: jax.Array, z_t1: jax.Array, *, deterministic: bool = False
     ) -> tuple[jax.Array, jax.Array]:
-        """Encode action between two specific frames.
-
-        Args:
-            z_t: Current frame tokens (B, num_patches, latent_dim)
-            z_t1: Next frame tokens (B, num_patches, latent_dim)
-
-        Returns:
-            action: Quantized action (B, action_dim)
-            index: Action index (B,)
-        """
-        # stack frames: (B, 2, P, latent_dim)
+        """encode action between two frames -> (action, index)"""
         z = jnp.stack([z_t, z_t1], axis=1)
-
         actions_q, _, indices = self(z, deterministic=deterministic)
-
-        # only one transition, so squeeze
         return actions_q[:, 0, :], indices[:, 0]
 
     def decode_action(self, indices: jax.Array) -> jax.Array:
-        """Decode action indices to action embeddings (for inference).
-
-        Args:
-            indices: Action indices (B,) or (B, T-1)
-
-        Returns:
-            actions: Action embeddings with same shape + action_dim
-        """
+        """indices -> action embeddings"""
         return self.action_vq.lookup(indices)

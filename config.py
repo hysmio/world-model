@@ -55,21 +55,13 @@ class TrainConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 1000
 
-    # stage 1: video tokenizer
+    # training steps per stage
     vt_steps: int = 10000
-    vt_recon_weight: float = 1.0
-    vt_vq_weight: float = 1.0
-
-    # stage 2: LAM
     lam_steps: int = 5000
-
-    # stage 3: dynamics
     dyn_steps: int = 20000
 
     # logging
     log_every: int = 100
-    save_every: int = 1000
-    eval_every: int = 500
 
     # wandb
     wandb_project: str = "genie"

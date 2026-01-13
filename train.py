@@ -13,7 +13,13 @@ from pathlib import Path
 nn = nnx
 
 from config import ModelConfig, TrainConfig
-from data import VideoDataset, MultiVideoDataset
+from data import (
+    VideoDataset,
+    MultiVideoDataset,
+    VPTDataset,
+    VPTStreamingDataset,
+    create_dataset,
+)
 from model.tokenizer import VTEncoder, VTDecoder
 from model.lam import LatentActionModel
 from model.dynamics import DynamicsModel
@@ -92,95 +98,13 @@ def create_optimizer(cfg: TrainConfig, num_steps: int):
     return optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay)
 
 
-# Stage 1: Video Tokenizer
-def vt_loss_fn(encoder, decoder, x, cfg: ModelConfig):
-    # x: (B, T, C, H, W)
-    z_q, vq_loss, _ = encoder(x, deterministic=False)
-
-    # decode back to pixels
-    h, w = cfg.frame_size
-    x_recon = decoder(z_q, img_height=h, img_width=w, deterministic=False)
-
-    # reconstruction loss (MSE)
-    recon_loss = jnp.mean((x - x_recon) ** 2)
-
-    return recon_loss, vq_loss, x_recon
-
-
-@nnx.jit
-def vt_train_step(encoder, decoder, optimizer, x, cfg: ModelConfig):
-    def loss_fn(encoder, decoder):
-        recon_loss, vq_loss, _ = vt_loss_fn(encoder, decoder, x, cfg)
-        return recon_loss + vq_loss, (recon_loss, vq_loss)
-
-    grads_enc, grads_dec = nnx.grad(loss_fn, argnums=(0, 1), has_aux=True)(encoder, decoder)
-    total_loss, (recon_loss, vq_loss) = loss_fn(encoder, decoder)
-
-    optimizer.update([grads_enc, grads_dec])
-
-    return {
-        "vt/total_loss": total_loss,
-        "vt/recon_loss": recon_loss,
-        "vt/vq_loss": vq_loss,
-    }
-
-
-# Stage 2: LAM
-@nnx.jit
-def lam_train_step(encoder, lam, optimizer, x):
-    def loss_fn(lam):
-        # encode frames (no grad through encoder)
-        z_q, _, _ = encoder(x, deterministic=True)
-        z_q = jax.lax.stop_gradient(z_q)
-
-        # infer actions
-        _, action_loss, _ = lam(z_q, deterministic=False)
-        return action_loss
-
-    grad = nnx.grad(loss_fn)(lam)
-    loss = loss_fn(lam)
-    optimizer.update(grad)
-
-    return {"lam/vq_loss": loss}
-
-
-# Stage 3: Dynamics
-@nnx.jit
-def dyn_train_step(encoder, lam, dynamics, optimizer, x):
-    def loss_fn(dynamics):
-        # encode frames
-        z_q, _, indices = encoder(x, deterministic=True)
-        z_q = jax.lax.stop_gradient(z_q)
-
-        # get actions from LAM
-        actions, _, _ = lam(z_q, deterministic=True)
-        actions = jax.lax.stop_gradient(actions)
-
-        # for each frame transition, predict next frame tokens
-        B, T, P, _ = z_q.shape
-        total_loss = 0.0
-
-        indices = indices.reshape(B, T, P)
-
-        for t in range(T - 1):
-            z_t = z_q[:, t, :, :]  # (B, P, latent_dim)
-            action_t = actions[:, t, :]  # (B, action_dim)
-            target = indices[:, t + 1, :]  # (B, P)
-
-            loss = dynamics.loss(z_t, action_t, target, deterministic=False)
-            total_loss = total_loss + loss
-
-        return total_loss / (T - 1)
-
-    grad = nnx.grad(loss_fn)(dynamics)
-    loss = loss_fn(dynamics)
-    optimizer.update(grad)
-
-    return {"dyn/ce_loss": loss}
-
-
 def train_stage1(
-    encoder, decoder, dataset, cfg: ModelConfig, train_cfg: TrainConfig, rng: np.random.Generator
+    encoder,
+    decoder,
+    dataset,
+    cfg: ModelConfig,
+    train_cfg: TrainConfig,
+    rng: np.random.Generator,
 ):
     print("=== Stage 1: Video Tokenizer ===")
 
@@ -194,14 +118,16 @@ def train_stage1(
         batch = dataset.sample_batch(train_cfg.batch_size, rng)
         x = jnp.array(batch)
 
-        # manual grad computation since we have two models
         def loss_fn(encoder, decoder):
-            recon_loss, vq_loss, _ = vt_loss_fn(encoder, decoder, x, cfg)
+            z_q, vq_loss, _ = encoder(x, deterministic=False)
+            h, w = cfg.frame_size
+            x_recon = decoder(z_q, img_height=h, img_width=w, deterministic=False)
+            recon_loss = jnp.mean((x - x_recon) ** 2)
             return recon_loss + vq_loss, (recon_loss, vq_loss)
 
-        (total_loss, (recon_loss, vq_loss)), (grads_enc, grads_dec) = nnx.value_and_grad(
-            loss_fn, argnums=(0, 1), has_aux=True
-        )(encoder, decoder)
+        (total_loss, (recon_loss, vq_loss)), (grads_enc, grads_dec) = (
+            nnx.value_and_grad(loss_fn, argnums=(0, 1), has_aux=True)(encoder, decoder)
+        )
 
         optimizer.update(grads_enc)
         optimizer_dec.update(grads_dec)
@@ -242,14 +168,23 @@ def train_stage2(
         optimizer.update(grad)
 
         if step % train_cfg.log_every == 0:
-            wandb.log({"lam/vq_loss": float(loss), "step": step}, step=train_cfg.vt_steps + step)
+            wandb.log(
+                {"lam/vq_loss": float(loss), "step": step},
+                step=train_cfg.vt_steps + step,
+            )
             print(f"[LAM] step {step}: loss={loss:.4f}")
 
     return lam
 
 
 def train_stage3(
-    encoder, lam, dynamics, dataset, cfg: ModelConfig, train_cfg: TrainConfig, rng: np.random.Generator
+    encoder,
+    lam,
+    dynamics,
+    dataset,
+    cfg: ModelConfig,
+    train_cfg: TrainConfig,
+    rng: np.random.Generator,
 ):
     print("=== Stage 3: Dynamics Model ===")
 
@@ -316,8 +251,16 @@ def save_checkpoint(path: Path, encoder, decoder, lam, dynamics, step: int):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, nargs="+", required=True, help="paths to video files or frame folders")
-    parser.add_argument("--frame-size", type=int, default=64, help="frame size (square)")
+    parser.add_argument(
+        "--data",
+        type=str,
+        nargs="+",
+        required=True,
+        help="paths to video files or frame folders",
+    )
+    parser.add_argument(
+        "--frame-size", type=int, default=64, help="frame size (square)"
+    )
     parser.add_argument("--patch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=8, help="sequence length")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -329,6 +272,28 @@ def main():
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--seed", type=int, default=42)
+
+    # VPT dataset options
+    parser.add_argument(
+        "--dataset-type",
+        type=str,
+        default="auto",
+        choices=["auto", "video", "frames", "vpt", "vpt_streaming"],
+        help="Dataset type (auto-detected by default)",
+    )
+    parser.add_argument(
+        "--cache-size",
+        type=int,
+        default=10,
+        help="Number of videos to cache in memory (VPT dataset)",
+    )
+    parser.add_argument(
+        "--max-videos",
+        type=int,
+        default=None,
+        help="Maximum number of videos to use (for debugging)",
+    )
+
     args = parser.parse_args()
 
     # configs
@@ -362,21 +327,35 @@ def main():
 
     # load data
     print(f"Loading data from {train_cfg.data_paths}")
+
+    # Use create_dataset factory for single path with auto-detection
     if len(train_cfg.data_paths) == 1:
-        dataset = VideoDataset(
+        dataset = create_dataset(
             train_cfg.data_paths[0],
             model_cfg.frame_size,
             train_cfg.sequence_length,
             train_cfg.stride,
+            dataset_type=args.dataset_type,
+            cache_size=args.cache_size,
+            max_videos=args.max_videos,
         )
     else:
+        # Multiple paths: use MultiVideoDataset for non-VPT data
+        if args.dataset_type in ("vpt", "vpt_streaming"):
+            raise ValueError("VPT dataset types only support single directory path")
         dataset = MultiVideoDataset(
-            train_cfg.data_paths,
+            [Path(p) for p in train_cfg.data_paths],
             model_cfg.frame_size,
             train_cfg.sequence_length,
             train_cfg.stride,
         )
-    print(f"Dataset: {len(dataset)} sequences")
+
+    # Print dataset info
+    if hasattr(dataset, "get_video_info"):
+        info = dataset.get_video_info()
+        print(f"Dataset info: {info}")
+    else:
+        print(f"Dataset: {len(dataset)} sequences")
 
     # create models
     rngs = nn.Rngs(args.seed)
@@ -385,16 +364,16 @@ def main():
     encoder, decoder, lam, dynamics = create_models(model_cfg, rngs)
 
     # training stages
-    encoder, decoder = train_stage1(encoder, decoder, dataset, model_cfg, train_cfg, rng)
+    encoder, decoder = train_stage1(
+        encoder, decoder, dataset, model_cfg, train_cfg, rng
+    )
     lam = train_stage2(encoder, lam, dataset, train_cfg, rng)
     dynamics = train_stage3(encoder, lam, dynamics, dataset, model_cfg, train_cfg, rng)
 
     # save final checkpoint
     total_steps = train_cfg.vt_steps + train_cfg.lam_steps + train_cfg.dyn_steps
     save_checkpoint(
-        Path(train_cfg.checkpoint_dir),
-        encoder, decoder, lam, dynamics,
-        total_steps
+        Path(train_cfg.checkpoint_dir), encoder, decoder, lam, dynamics, total_steps
     )
 
     wandb.finish()

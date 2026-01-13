@@ -2,12 +2,40 @@ import argparse
 import jax
 import numpy as np
 import cv2
+import orbax.checkpoint as ocp
 from flax import nnx
 from jax import numpy as jnp
 from pathlib import Path
 
 from config import ModelConfig
 from train import create_models
+
+
+def load_checkpoint(path: Path, encoder, decoder, lam, dynamics):
+    """load model weights from checkpoint"""
+    checkpointer = ocp.StandardCheckpointer()
+
+    _, encoder_state = nnx.split(encoder)
+    _, decoder_state = nnx.split(decoder)
+    _, lam_state = nnx.split(lam)
+    _, dynamics_state = nnx.split(dynamics)
+
+    target = {
+        "encoder": encoder_state,
+        "decoder": decoder_state,
+        "lam": lam_state,
+        "dynamics": dynamics_state,
+        "step": 0,
+    }
+
+    restored = checkpointer.restore(path, target)
+
+    nnx.update(encoder, restored["encoder"])
+    nnx.update(decoder, restored["decoder"])
+    nnx.update(lam, restored["lam"])
+    nnx.update(dynamics, restored["dynamics"])
+
+    return restored["step"]
 
 
 def generate_frames(
@@ -97,20 +125,25 @@ def main():
         patch_size=args.patch_size,
     )
 
-    # create models
     rngs = nnx.Rngs(args.seed)
     encoder, decoder, lam, dynamics = create_models(cfg, rngs)
 
-    # TODO: load checkpoint weights
-    # for now just use random weights for testing
+    # load checkpoint
+    ckpt_path = Path(args.checkpoint)
+    if ckpt_path.exists():
+        step = load_checkpoint(ckpt_path, encoder, decoder, lam, dynamics)
+        print(f"Loaded checkpoint from step {step}")
+    else:
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     # load initial frame
     img = cv2.imread(args.initial_frame)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, cfg.frame_size)
+    h, w = cfg.frame_size
+    img = cv2.resize(img, (w, h))  # cv2 expects (w, h)
     img = img.astype(np.float32) / 127.5 - 1.0
-    img = np.transpose(img, (2, 0, 1))  # (C, H, W)
-    initial = jnp.array(img)[None, None, :, :, :]  # (1, 1, C, H, W)
+    img = np.transpose(img, (2, 0, 1))
+    initial = jnp.array(img)[None, None, :, :, :]
 
     print(f"Generating {args.num_frames} frames...")
     rng_key = jax.random.key(args.seed)
